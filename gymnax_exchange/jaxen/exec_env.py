@@ -130,9 +130,8 @@ from gymnax_exchange.jaxob import JaxOrderBookArrays as job
 from gymnax_exchange.jaxen.base_env import BaseLOBEnv
 from gymnax_exchange.utils import utils
 import dataclasses
-from gymnax_exchange.jaxob.jaxob_config import Execution_EnvironmentConfig,World_EnvironmentConfig
+from gymnax_exchange.config.env_configs import Execution_EnvironmentConfig, World_EnvironmentConfig
 from gymnax_exchange.jaxen.StatesandParams import ExecEnvState, ExecEnvParams, MultiAgentState, WorldState
-from gymnax_exchange.jaxob.jaxob_config import World_EnvironmentConfig
 from gymnax_exchange.jaxen.from_JAXMARL import spaces
 
 #from gymnax_exchange.jaxen.from_JAXMARL import spaces
@@ -163,6 +162,8 @@ class ExecutionAgent():
             self.action_fn = self._getActionMsgs_fixedQuant
         elif self.cfg.action_space == "fixed_quants_complex":
             self.action_fn = self._getActionMsgs_fixedQuant_extended
+        elif self.cfg.action_space == "fixed_quants_5act":
+            self.action_fn = self._getActionMsgs_fixedQuant_5act
         elif self.cfg.action_space == "fixed_prices":
             self.action_fn = self._getActionMsgs_fixedPrice
         elif self.cfg.action_space == "simplest_case":
@@ -932,6 +933,83 @@ class ExecutionAgent():
         return action_msgs,{}
 
 
+    def _getActionMsgs_fixedQuant_5act(self, action: jax.Array, world_state: WorldState, agent_state: ExecEnvState, agent_params: ExecEnvParams):
+        """Action function for the compressed 5-action execution space.
+        Based on empirical analysis of the 13-action fixed_quants_complex:
+        - FT (far_touch) dominates all other price levels
+        - ×5 quantity is strongly preferred, ×2 is moderate, ×1 is conservative
+        - M (mid) ×5 is the only useful non-FT alternative
+        - NT (near_touch) and PP (past passive) are always learned AWAY from
+
+        0 = SKIP (no trade)
+        1 = FT×1  (small aggressive)
+        2 = FT×5  (large aggressive, was the dominant action)
+        3 = FT×2  (medium aggressive)
+        4 = M×5   (mid-price alternative)
+       """
+
+        #----01 get price levels----#
+        best_ask = jnp.int32((world_state.best_asks[-1][0] // self.world_config.tick_size) * self.world_config.tick_size)
+        best_bid = jnp.int32((world_state.best_bids[-1][0] // self.world_config.tick_size) * self.world_config.tick_size)
+
+        def buy_task_prices(best_ask, best_bid):
+            FT = best_ask
+            M = ((best_bid + best_ask) // 2 // self.world_config.tick_size) * self.world_config.tick_size
+            return FT, M
+        def sell_task_prices(best_ask, best_bid):
+            FT = best_bid
+            M = (jnp.ceil((best_bid + best_ask) / 2 // self.world_config.tick_size) * self.world_config.tick_size).astype(jnp.int32)
+            return FT, M
+
+        price_levels = jax.lax.cond(
+            agent_state.is_sell_task,
+            sell_task_prices,
+            buy_task_prices,
+            best_ask, best_bid
+        )
+        # price_levels is (FT, M) — only 2 price levels needed for 5 actions
+        # action 0-3 use FT (index 0), action 4 uses M (index 1)
+
+        #----02 get quants----#
+        quant_array = jnp.array([
+            [0, 0],  # 0: SKIP
+            [1, 0],  # 1: FT×1
+            [5, 0],  # 2: FT×5
+            [2, 0],  # 3: FT×2
+            [0, 5],  # 4: M×5
+        ])
+        quants = quant_array[action, :] * self.cfg.fixed_quant_value
+        quants = quants.flatten()
+
+        #----03 get the rest of the message----#
+        types = jnp.ones((self.cfg.num_action_messages_by_agent,), jnp.int32)
+        sides = (1 - agent_state.is_sell_task*2) * jnp.ones((self.cfg.num_action_messages_by_agent,), jnp.int32)
+        trader_ids = jnp.ones((self.cfg.num_action_messages_by_agent,), jnp.int32) * agent_params.trader_id
+        order_ids = jnp.full((self.cfg.num_action_messages_by_agent,), self.world_config.placeholder_order_id, dtype=jnp.int32)
+        times = jnp.resize(
+            world_state.time + self.cfg.time_delay_obs_act,
+            (self.cfg.num_action_messages_by_agent, 2)
+        )
+
+        #------Check quants dont exceed remaining task----#
+        quant_left = agent_state.task_to_execute - agent_state.quant_executed
+        total_quant = quants.sum()
+        quants = jnp.where(
+            total_quant <= quant_left,
+            quants,
+            jnp.floor(quant_array[1] * quant_left)
+        ).astype(jnp.int32)
+
+        #--make arrays--#
+        quants = jnp.array(quants)
+        price_levels = jnp.array(price_levels)
+
+        #---form messages---#
+        action_msgs = jnp.stack([types, sides, quants, price_levels, order_ids, trader_ids], axis=1)
+        action_msgs = jnp.concatenate([action_msgs, times], axis=1)
+        return action_msgs, {}
+
+
     def _getActionMsgs_simpleCase(self, action: jax.Array, world_state: WorldState, agent_state: ExecEnvState, agent_params: ExecEnvParams):
         """Action function for the simplest execution case
         Always send 1 message
@@ -1178,7 +1256,7 @@ class ExecutionAgent():
         )
 
         quant_array = jnp.array([
-                [1, 0],  # FT
+                [0, 1],  # NT (覆盖 FT，被动价格作为 TWAP 基线)
                 [0, 1],  # NT
             ])
 
@@ -1226,6 +1304,68 @@ class ExecutionAgent():
 
 
 
+    def _order_manager(self, target_msgs, world_state, agent_state, agent_params):
+        """
+        OrderManager for Execution agent.
+        Compare target orders with current agent orders on the task-side book.
+        Only send cancel/re-place messages for changed orders;
+        identical orders are kept (preserving queue position).
+        
+        Args:
+            target_msgs: (n_action, 8) - what the agent wants
+            world_state: current WorldState
+            agent_state: current ExecEnvState (has is_sell_task)
+            agent_params: has trader_id
+        Returns:
+            opt_action_msgs: (n_action, 8)
+            opt_cancel_msgs: (n_cancel, 8)
+        """
+        side_for_exe = 1 - agent_state.is_sell_task * 2  # 1 for buy, -1 for sell
+        raw_order_side = jax.lax.cond(
+            agent_state.is_sell_task,
+            lambda: world_state.ask_raw_orders,
+            lambda: world_state.bid_raw_orders
+        )
+        cancel_size = self.cfg.num_messages_by_agent // 2
+
+        # 1. Find current orders on the task side
+        current_msgs = job.getCancelMsgs(
+            bookside=raw_order_side,
+            agentID=agent_params.trader_id,
+            size=cancel_size,
+            side=side_for_exe,
+            cancel_time=world_state.time[0],
+            cancel_time_ns=world_state.time[1]
+        )
+
+        # 2. Extract comparison vectors
+        t_price = target_msgs[:, 3]
+        t_qty = target_msgs[:, 2]
+        t_valid = (t_price != 0)
+
+        c_price = current_msgs[:, 3]
+        c_qty = current_msgs[:, 2]
+        c_valid = (c_price != 0)
+
+        # 3. Match matrix: (n_cancel, n_action)
+        #    All current orders are on the same side (task side),
+        #    so we only need to match price + qty.
+        same_price = (c_price[:, None] == t_price[None, :])
+        same_qty = (c_qty[:, None] == t_qty[None, :])
+        both_valid = (c_valid[:, None] & t_valid[None, :])
+        match = same_price & same_qty & both_valid
+
+        # 4. Keep current orders that match a target; skip targets that match a current
+        c_keep = jnp.any(match, axis=1)
+        t_skip = jnp.any(match, axis=0)
+
+        # 5. Build optimized messages
+        opt_cancel = jnp.where(~c_keep[:, None], current_msgs, jnp.zeros_like(current_msgs))
+        opt_action = jnp.where(~t_skip[:, None], target_msgs, jnp.zeros_like(target_msgs))
+
+        return opt_action, opt_cancel
+
+
     def get_messages(
         self,
         action: jax.Array,
@@ -1243,28 +1383,35 @@ class ExecutionAgent():
             agent_params
         )
 
-        # 2. Determine which side to cancel (buy or sell task)
-        side_for_exe = 1 - agent_state.is_sell_task * 2  # 1 for buy, -1 for sell
+        if self.cfg.use_order_manager:
+            # OrderManager: only cancel/re-place changed orders
+            action_msgs, cancel_msgs = self._order_manager(
+                action_msgs, world_state, agent_state, agent_params
+            )
+        else:
+            # Legacy: cancel all then filter
+            # 2. Determine which side to cancel (buy or sell task)
+            side_for_exe = 1 - agent_state.is_sell_task * 2  # 1 for buy, -1 for sell
 
-        # 3. Select the correct book side
-        raw_order_side = jax.lax.cond(
-            agent_state.is_sell_task,
-            lambda: world_state.ask_raw_orders,
-            lambda: world_state.bid_raw_orders
-        )
+            # 3. Select the correct book side
+            raw_order_side = jax.lax.cond(
+                agent_state.is_sell_task,
+                lambda: world_state.ask_raw_orders,
+                lambda: world_state.bid_raw_orders
+            )
 
-        # 4. Get cancel messages
-        cancel_msgs = job.getCancelMsgs(
-            bookside=raw_order_side,
-            agentID=agent_params.trader_id,
-            size=self.cfg.num_messages_by_agent // 2,  # adjust if needed
-            side=side_for_exe,
-            cancel_time=world_state.time[0],
-            cancel_time_ns=world_state.time[1]
-        )
+            # 4. Get cancel messages
+            cancel_msgs = job.getCancelMsgs(
+                bookside=raw_order_side,
+                agentID=agent_params.trader_id,
+                size=self.cfg.num_messages_by_agent // 2,  # adjust if needed
+                side=side_for_exe,
+                cancel_time=world_state.time[0],
+                cancel_time_ns=world_state.time[1]
+            )
 
-        # 5. Filter messages
-        action_msgs, cancel_msgs = self._filter_messages(action_msgs, cancel_msgs)
+            # 5. Filter messages
+            action_msgs, cancel_msgs = self._filter_messages(action_msgs, cancel_msgs)
 
         #jax.debug.print("action messages order exec: {}", action_msgs)
         #jax.debug.print("cancel messages order exec: {}", cancel_msgs)
@@ -1299,6 +1446,8 @@ class ExecutionAgent():
         elif self.cfg.action_space == "fixed_prices":
             return self.action_fn(action = action, world_state = world_state, agent_state = agent_state, agent_params = agent_params)
         elif self.cfg.action_space == "fixed_quants_complex":
+            return self.action_fn(action = action, world_state = world_state, agent_state = agent_state, agent_params = agent_params)
+        elif self.cfg.action_space == "fixed_quants_5act":
             return self.action_fn(action = action, world_state = world_state, agent_state = agent_state, agent_params = agent_params)
         elif self.cfg.action_space == "simplest_case":
             return self.action_fn(action = action, world_state = world_state, agent_state = agent_state, agent_params = agent_params)
@@ -2009,22 +2158,38 @@ class ExecutionAgent():
                 "remaining_ratio": 1,
             }
         elif self.world_config.ep_type == "fixed_steps": # leave away time related stuff
+            # --- Engineered feature engineering ---
+            spread_val = jnp.abs(quote_aggr[0] - quote_pass[0])
+            remaining_quant = agent_state.task_to_execute - agent_state.quant_executed
+            remaining_ratio = jnp.where(world_state.max_steps_in_episode==0, 0., 1. - world_state.step_counter / world_state.max_steps_in_episode)
+            # VWAP deviation: how far current price is from start (fractional)
+            aggr_price = quote_aggr[0].astype(jnp.float32)
+            vwap_deviation = (aggr_price - agent_state.init_price) / jnp.maximum(jnp.abs(agent_state.init_price), 1.0)
+            # Spread ratio (dimensionless)
+            spread_ratio = spread_val / jnp.maximum(aggr_price, 1.0)
+            # Task completion ratio
+            filled_ratio = agent_state.quant_executed / jnp.maximum(agent_state.task_to_execute, 1)
+            # Urgency: remaining work fraction adjusted by remaining time
+            urgency = remaining_quant / jnp.maximum(agent_state.task_to_execute, 1) * (1.0 - remaining_ratio + 1e-8)
+
             obs = {
                 "is_sell_task": agent_state.is_sell_task,
-                "p_aggr": quote_aggr[0], #* sign_switch,  # switch sign for buy task TODO why do we have a sign switch here?
-                "p_pass": quote_pass[0], #* sign_switch,  # switch sign for buy task
-                "spread": jnp.abs(quote_aggr[0] - quote_pass[0]),
+                "p_aggr": quote_aggr[0],
+                "p_pass": quote_pass[0],
+                "spread": spread_val,
                 "q_aggr": vol_aggr,
                 "q_pass": vol_pass,
-                #"q_pass2": state.quant_passive_2, # TODO add price here, calculate it correctly
-                # "q_before2": None, # how much quantity lies above this price level
                 "init_price": agent_state.init_price,
                 "task_size": agent_state.task_to_execute,
                 "executed_quant": agent_state.quant_executed,
-                "remaining_quant": agent_state.task_to_execute - agent_state.quant_executed,
+                "remaining_quant": remaining_quant,
                 "step_counter": world_state.step_counter,
-                # "remaining_ratio": 1. - jnp.nan_to_num(state.step_counter / state.max_steps_in_episode, nan=1.),
-                "remaining_ratio": jnp.where(world_state.max_steps_in_episode==0, 0., 1. - world_state.step_counter / world_state.max_steps_in_episode),#17
+                "remaining_ratio": remaining_ratio,
+                # New engineered features
+                "vwap_deviation": vwap_deviation,
+                "spread_ratio": spread_ratio,
+                "filled_ratio": filled_ratio,
+                "urgency": urgency,
             }
             # jax.debug.print('prev_action {}', state.prev_action)
             # jax.debug.print('prev_executed {}', state.prev_executed)
@@ -2036,33 +2201,41 @@ class ExecutionAgent():
             p_std = 1e6
             means = {
                 "is_sell_task": 0,
-                "p_aggr": agent_state.init_price, #* sign_switch, #p_mean,
-                "p_pass": agent_state.init_price, #* sign_switch, #p_mean,
+                "p_aggr": agent_state.init_price,
+                "p_pass": agent_state.init_price,
                 "spread": 0,
                 "q_aggr": 0,
                 "q_pass": 0,
-                #"q_pass2": 0,
-                "init_price": 0, #p_mean,
+                "init_price": 0,
                 "task_size": 0,
                 "executed_quant": 0,
                 "remaining_quant": 0,
                 "step_counter": 0,
                 "remaining_ratio": 0,
+                # New features
+                "vwap_deviation": 0.0,
+                "spread_ratio": 0.0,
+                "filled_ratio": 0.0,
+                "urgency": 0.0,
             }
             stds = {
                 "is_sell_task": 1,
-                "p_aggr": 1e5, #p_std,
-                "p_pass": 1e5, #p_std,
+                "p_aggr": 1e5,
+                "p_pass": 1e5,
                 "spread": 1e4,
                 "q_aggr": 1000,
                 "q_pass": 1000,
-            #"q_pass2": 100,
-                "init_price": 1e7, #p_std,
+                "init_price": 1e7,
                 "task_size": self.cfg.task_size,
                 "executed_quant": self.cfg.task_size,
                 "remaining_quant": self.cfg.task_size,
-                "step_counter": 30,  # TODO: find way to make this dependent on episode length
+                "step_counter": 30,
                 "remaining_ratio": 1,
+                # New features
+                "vwap_deviation": 1.0,
+                "spread_ratio": 0.01,
+                "filled_ratio": 1.0,
+                "urgency": 1.0,
             }
         # print("obs:", obs)
 
@@ -2177,6 +2350,8 @@ class ExecutionAgent():
             return spaces.Discrete(self.cfg.n_actions)
         elif self.cfg.action_space=="fixed_quants_complex":
             return spaces.Discrete(self.cfg.n_actions)
+        elif self.cfg.action_space=="fixed_quants_5act":
+            return spaces.Discrete(self.cfg.n_actions)
         elif self.cfg.action_space=="simplest_case":
             return spaces.Discrete(self.cfg.n_actions)
         elif self.cfg.action_space=="twap":
@@ -2193,7 +2368,7 @@ class ExecutionAgent():
             if self.world_config.ep_type == "fixed_time":
                 space = spaces.Box(-10000, 10000, (15,), dtype=jnp.float32) 
             elif self.world_config.ep_type == "fixed_steps":
-                space = spaces.Box(-10000, 10000, (12,), dtype=jnp.float32) 
+                space = spaces.Box(-10000, 10000, (16,), dtype=jnp.float32) 
             return space
         elif self.cfg.observation_space == "simplest_case":
             space = spaces.Box(-10000, 10000, (3,), dtype=jnp.float32) 
@@ -2443,7 +2618,7 @@ if __name__ == "__main__":
     time.sleep(1)
 
     from gymnax_exchange.jaxen.marl_env import MARLEnv
-    from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig
+    from gymnax_exchange.config.env_configs import MultiAgentConfig
 
     multi_agent_config = MultiAgentConfig(list_of_agents_configs=[
                                 Execution_EnvironmentConfig(action_space="simplest_case",

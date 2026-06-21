@@ -31,10 +31,10 @@ from gymnax_exchange.jaxen.StatesandParams import MultiAgentState, MultiAgentPar
 
 
 from gymnax_exchange.jaxob import JaxOrderBookArrays as job
-from gymnax_exchange.jaxob.jaxob_config import MarketMaking_EnvironmentConfig
-from gymnax_exchange.jaxob.jaxob_config import Execution_EnvironmentConfig
-from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig
-from gymnax_exchange.jaxob.jaxob_config import World_EnvironmentConfig
+from gymnax_exchange.config.env_configs import MarketMaking_EnvironmentConfig
+from gymnax_exchange.config.env_configs import Execution_EnvironmentConfig
+from gymnax_exchange.config.env_configs import MultiAgentConfig
+from gymnax_exchange.config.env_configs import World_EnvironmentConfig
 
 import numpy as np
 np.set_printoptions(threshold=np.iinfo(np.int32).max, linewidth=200)

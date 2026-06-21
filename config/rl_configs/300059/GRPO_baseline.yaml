@@ -1,0 +1,111 @@
+# ============================================================
+# GRPO: 300059 (东方财富) [10MM,10EXE] — quo=100, inv_gamma=0.15
+# 
+# 基于 A1 (spooner) 的结论: spooner 让 MM 首次正收益
+# 但 EXE 仍卡在 -0.227
+# 回看 lucky-eon-1 (quo=100) 的 EXE=-0.045 最好
+# 
+# 假设: quo=100 对 EXE 有帮助，合并 inv_gamma=0.15
+# ============================================================
+
+"LR": [0.0001,0.0001]
+"NUM_ENVS": 16384
+"NUM_STEPS": 64
+"NUM_STEPS_EVAL" : 64
+"GRU_HIDDEN_DIM": 128
+"FC_DIM_SIZE": 128
+"TOTAL_TIMESTEPS": 2e8
+"UPDATE_EPOCHS": 4
+"NUM_MINIBATCHES": 32
+
+"KL_COEF": [0.01, 0.01]
+"CLIP_EPS": 0.2
+"SCALE_CLIP_EPS": [False,False]
+"ENT_COEF": [0.001, 0.001]
+"MAX_GRAD_NORM": [0.5,0.5]
+"ACTIVATION": ["relu","relu"]
+"ENV_NAME": "JAXMARL-Lob-v0"
+"NUM_AGENTS_PER_TYPE": [10,10]
+"SEED": 3
+"N_DEVICES": 4
+"ENV_CONFIG": null
+"ANNEAL_LR": [True,True]
+
+"ENTITY": "2670933993-"
+"PROJECT": "PMAP_GRPO_300059_v2"
+"WANDB_MODE" : "online"
+
+"CALC_EVAL" : False
+"TimePeriod" : "20240103,20240104,20240105,20240108,20240109,20240110,20240111,20240112,20240115,20240116,20240117,20240118,20240119,20240122,20240123,20240124,20240125,20240126,20240129,20240130,20240131,20240201,20240202,20240205,20240206,20240207,20240208,20240219,20240220,20240221,20240222,20240223,20240226,20240227,20240228,20240229,20240301,20240304,20240305,20240306,20240307,20240308,20240311,20240312,20240313,20240314,20240315,20240318,20240319,20240320,20240321,20240322,20240325,20240326,20240327,20240328,20240329"
+"EvalTimePeriod" : "20240103,20240104,20240105,20240108,20240109,20240110,20240111,20240112,20240115,20240116,20240117,20240118,20240119,20240122,20240123,20240124,20240125,20240126,20240129,20240130,20240131,20240201,20240202,20240205,20240206,20240207,20240208,20240219,20240220,20240221,20240222,20240223,20240226,20240227,20240228,20240229,20240301,20240304,20240305,20240306,20240307,20240308,20240311,20240312,20240313,20240314,20240315,20240318,20240319,20240320,20240321,20240322,20240325,20240326,20240327,20240328,20240329"
+"Calculate Baseline" : False
+"Timing" : True
+
+"AGENT_CONFIGS":
+  MarketMaking:
+    action_space: "fixed_quants"
+    observation_space: "engineered"
+    reward_function: "tplus1"
+    inventoryPnL_eta: 0.5
+    inventoryPnL_gamma: 0.15
+    spread_multiplier: 2.0
+    skew_multiplier: 3.0
+    n_ticks_offset: 1
+    fixed_quant_value: 6
+    auto_liquidate_threshold: 0
+    auto_liquidate_alpha: 1.0
+    unwind_price_penalty: 0
+    inv_penalty: "none"
+    volume_traded_bonus: "none"
+    reference_price: "mid"
+    unwind_price: "mid"
+    inv_penalty_lambda: 1.0
+    inv_penalty_quadratic_factor: 80.0
+    inv_penalty_threshold: 8.0
+    multiplier_type: "tick"
+    reward_scaling_quo: 100.0
+    rebate_bps: 0.0
+    commission_bps: 1.0
+    initial_base_inventory: 500
+    overnight_penalty_lambda: 0.01
+    stamp_duty_bps: 5
+    avst_k_parameter: 0.8
+    avst_var_parameter: 500
+    time_delay_obs_act: 0
+    use_order_manager: True
+    n_actions: 3
+    num_messages_by_agent: 4
+    num_action_messages_by_agent: 2
+  Execution:
+    action_type: "pure"
+    task: "random"
+    action_space: "fixed_quants_5act"
+    observation_space: "engineered"
+    reward_function: "normal"
+    task_size: 1000
+    n_ticks_in_book: 1
+    fixed_quant_value: 30
+    reward_lambda: 0.0
+    reward_scaling_quo: 100.0
+    doom_price_penalty: 3
+    reference_price: "far_touch"
+    time_delay_obs_act: 0
+    use_order_manager: True
+    n_actions: 5
+    num_messages_by_agent: 2
+    num_action_messages_by_agent: 2
+
+"world_config": {
+  "alphatradePath": "/home/atomus/JaxMARL-HFT",
+  "dataPath": "/home/atomus/JaxMARL-HFT/data",
+  "stock": "300059",
+  "timePeriod": "20240103",
+  "day_start": 34200,
+  "day_end": 54000,
+  "tick_size": 100,
+  "book_depth": 10,
+  "n_data_msg_per_step": 120,
+  "start_resolution": 64,
+  "ep_type": "fixed_steps",
+  "episode_time": 64
+}

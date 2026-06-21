@@ -5,7 +5,7 @@ from readline import remove_history_item
 from typing import Dict, NamedTuple, Optional, Tuple
 from unicodedata import bidirectional
 import gymnax_exchange.jaxob.JaxOrderBookArrays as job
-from gymnax_exchange.jaxob.jaxob_config import JAXLOB_Configuration
+from gymnax_exchange.config.env_configs import JAXLOB_Configuration
 job = importlib.reload(job)
 import jax
 from jax import numpy as jnp

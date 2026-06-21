@@ -52,6 +52,10 @@ class MMEnvState():
     inventory: int
     total_PnL: float
     cash_balance: float
+    # T+1 settlement fields
+    base_inventory: int       # shares from previous days (can be sold)
+    intraday_buys: int        # shares bought today (locked, can't sell)
+    base_cost_basis: float    # cost basis for base_inventory
 
 
 @struct.dataclass

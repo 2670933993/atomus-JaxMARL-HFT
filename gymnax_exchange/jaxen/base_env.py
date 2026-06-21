@@ -76,7 +76,7 @@ from jax.experimental import checkify
 import os
 
 #Config File:
-from gymnax_exchange.jaxob.jaxob_config import World_EnvironmentConfig
+from gymnax_exchange.config.env_configs import World_EnvironmentConfig
 from gymnax_exchange.jaxen.StatesandParams import LoadedEnvParams, LoadedEnvState, WorldState
 
 
@@ -396,9 +396,17 @@ class BaseLOBEnv(environment.Environment):
             return bid_passive_2,quant_bid_passive_2,ask_passive_2,quant_ask_passive_2
 
     def _get_filename_suffix(self):
+        import hashlib
+        tp = str(self.cfg.timePeriod)
+        # Hash long timePeriod to avoid OSError: File name too long
+        if len(tp) > 30:
+            short = hashlib.md5(tp.encode()).hexdigest()[:12]
+            tp_short = f"{tp[:15]}...{short}"
+        else:
+            tp_short = tp
         filename_params = [
             str(self.cfg.stock),
-            str(self.cfg.timePeriod),
+            tp_short,
             str(self.cfg.book_depth),
             str(self.cfg.ep_type),
             str(self.cfg.episode_time),

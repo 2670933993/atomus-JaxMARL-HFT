@@ -25,10 +25,10 @@ jax.config.update("jax_log_compiles", False)
 
 
 from gymnax_exchange.jaxob import JaxOrderBookArrays as job
-from gymnax_exchange.jaxob.jaxob_config import MarketMaking_EnvironmentConfig
-from gymnax_exchange.jaxob.jaxob_config import Execution_EnvironmentConfig
-from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig
-from gymnax_exchange.jaxob.jaxob_config import World_EnvironmentConfig
+from gymnax_exchange.config.env_configs import MarketMaking_EnvironmentConfig
+from gymnax_exchange.config.env_configs import Execution_EnvironmentConfig
+from gymnax_exchange.config.env_configs import MultiAgentConfig
+from gymnax_exchange.config.env_configs import World_EnvironmentConfig
 
 from gymnax_exchange.jaxen.marl_env import MARLEnv
 

@@ -1,0 +1,136 @@
+"""
+Centralized constants for the JAX-LOB exchange simulator.
+
+Previously split across:
+- gymnax_exchange/jaxob/jaxob_constants.py
+- gymnax_exchange/jaxlobster/constants.py (LOBSTER field names only)
+
+All enum constants and magic values are consolidated here.
+"""
+
+from enum import Enum
+
+# ──────────────────────────────────────────────
+# Numeric Limits
+# ──────────────────────────────────────────────
+
+class MaxInt(Enum):
+    _64_Bit_Signed = 2_147_483_647
+    _32_Bit_Signed = 32_767
+
+
+# ──────────────────────────────────────────────
+# Magic / Sentinel Values
+# ──────────────────────────────────────────────
+
+INITID = -2
+NEGATIVE_RETURN_ID = -99
+DUMMYID = -888888
+EMPTY_SLOT = -1
+
+ORDERBOOK_FEAT = 6
+TRADE_FEAT = 8
+NS_PER_SEC = 1e9
+
+SEED = 42  # the meaning of life.
+
+NTRADE_CAP = 100
+NORDER_CAP = 100
+STARTOFDAY = [34200, 0]
+ENDOFDAY = [57600, 0]
+TEST_TIME = [44444, 44444]
+
+
+# ──────────────────────────────────────────────
+# LOBSTER Message Types (from LOBSTER data)
+# ──────────────────────────────────────────────
+
+class MessageType(Enum):
+    LIMIT = 1
+    CANCEL = 2
+    DELETE = 3
+    MATCH = 4
+    HIDDEN = 5
+    AUCTION = 6
+    HALT = 7
+
+
+class OrderSideFeat(Enum):
+    P = 0      # Price
+    Q = 1      # Quantity
+    OID = 2    # Order ID
+    TID = 3    # Trade ID
+    SEC = 4    # Seconds
+    NSEC = 5   # Nanoseconds
+
+
+class TradesFeat(Enum):
+    P = 0        # Price
+    Q = 1        # Quantity
+    PASS_OID = 2 # Order ID
+    AGRS_OID = 3 # Trade ID
+    SEC = 4      # Seconds
+    NSEC = 5     # Nanoseconds
+    PASS_TID = 6 # Order ID
+    AGRS_TID = 7 # Trade ID
+
+
+class BidAskSide(Enum):
+    BID = 1
+    ASK = -1
+
+
+# ──────────────────────────────────────────────
+# Exchange Simulator Modes
+# ──────────────────────────────────────────────
+
+class CancelMode(Enum):
+    STRICT_BY_ID = 0               # Cancel only if ID matches.
+    INCLUDE_INITS = 1              # Cancel only init orders if ID does not match.
+    CANCEL_UNIFORM = 2             # Pick a random order at the right price level to cancel.
+    CANCEL_UNIFORM_AND_LARGE = 3   # Unused for now.
+
+
+class Type4Interpretation(Enum):
+    IOC = 0  # Limit order that removes liquidity only. Unmatched quantity NOT added to the book.
+    LIM = 1  # Limit order that removes and adds liquidity. Unmatched quantity IS added to the book.
+    MKT = 2  # Limit order with extreme price (maxint for buys, 0 for sells) that removes liquidity only.
+             # NOTE: MKT is catastrophic for speed: every order ends up being calculated as if it were a MO under vmap.
+
+
+class SimulatorMode(Enum):
+    GENERAL_EXCHANGE = 0
+    LOBSTER_INTERPRETER = 1
+
+
+class LOBMSGFEAT(Enum):
+    Type = 0   # Message type
+    Side = 1   # Order side (buy/sell)
+    Quant = 2  # Quantity
+    Price = 3  # Price
+    OID = 4    # Order ID
+    TID = 5    # Trade ID
+    TS = 6     # Timestamp seconds
+    TNS = 7    # Timestamp nanoseconds
+
+
+# ──────────────────────────────────────────────
+# LOBSTER Token / Column Names (used by loader)
+# ──────────────────────────────────────────────
+
+TIME_COL = "<time>"
+EVENT_TYPE_COL = "<event_type>"
+ORDER_ID_COL = "<order_id>"
+SIZE_COL = "<size>"
+PRICE_COL = "<price>"
+DIRECTION_COL = "<direction>"
+
+MESSAGE_TOKEN_DTYPE_MAP = {
+    TIME_COL: int,
+    EVENT_TYPE_COL: int,
+    ORDER_ID_COL: int,
+    SIZE_COL: int,
+    PRICE_COL: int,
+    DIRECTION_COL: int,
+}
+MESSAGE_TOKEN_TYPES = list(MESSAGE_TOKEN_DTYPE_MAP.keys())

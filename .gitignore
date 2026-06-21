@@ -107,6 +107,7 @@ saved_npz/
 test.py
 
 data/*
+.reasonix/*
 scratch/*
 lob_bench/*
 debug_output/*

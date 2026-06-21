@@ -34,8 +34,8 @@
 
 # High-Level Params
 "CALC_EVAL" : False
-"TimePeriod" : "2024"
-"EvalTimePeriod" : "2024"
+"TimePeriod" : "20120621"
+"EvalTimePeriod" : "20120621"
 "Calculate Baseline" : False
 "Timing" : False
 

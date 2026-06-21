@@ -207,9 +207,16 @@ class LoadLOBSTER():
 
     def _get_save_filename(self, string_suffix="NONE_GIVEN"):
         """Generate cache filename for the processed data."""
+        import hashlib
         # Create directory if it doesn't exist
         os.makedirs(os.path.join(self.alphatrade_path, "saved_npz"), exist_ok=True)
-        fname = f"saved_npz/loaded_lobster_{str(self.__class__.__name__)}_{string_suffix}.npz"
+        # Truncate long suffixes to avoid OSError: File name too long
+        if len(string_suffix) > 50:
+            short = hashlib.md5(string_suffix.encode()).hexdigest()[:12]
+            suffix_short = f"{string_suffix[:15]}...{short}"
+        else:
+            suffix_short = string_suffix
+        fname = f"saved_npz/loaded_lobster_{str(self.__class__.__name__)}_{suffix_short}.npz"
         return os.path.join(self.alphatrade_path, fname)
 
     def _pad_window_cubes(self,cubes_withOB):
@@ -694,10 +701,17 @@ class LoadLOBSTER_resample():
 
         return msgs,starts,ends,obs,max_msgs_in_windows_arr
     
-    def _get_save_filename(self,string_suffix="NONE_GIVEN"):
+    def _get_save_filename(self, string_suffix="NONE_GIVEN"):
+        import hashlib
         # Create directory if it doesn't exist
         os.makedirs(os.path.join(self.alphatrade_path, "saved_npz"), exist_ok=True)
-        fname = f"saved_npz/loaded_lobster_{str(self.__class__.__name__)}_{string_suffix}.npz"
+        # Truncate long suffixes to avoid OSError: File name too long
+        if len(string_suffix) > 50:
+            short = hashlib.md5(string_suffix.encode()).hexdigest()[:12]
+            suffix_short = f"{string_suffix[:15]}...{short}"
+        else:
+            suffix_short = string_suffix
+        fname = f"saved_npz/loaded_lobster_{str(self.__class__.__name__)}_{suffix_short}.npz"
         return os.path.join(self.alphatrade_path, fname)
 
     def _pad_last_ep(self,messages,max_msgs_in_windows_arr):

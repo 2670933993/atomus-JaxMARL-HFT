@@ -139,12 +139,11 @@ import dataclasses
 import jax.tree_util as jtu
 
 
-from gymnax_exchange.jaxob.jaxob_config import MarketMaking_EnvironmentConfig
+from gymnax_exchange.config.env_configs import MarketMaking_EnvironmentConfig, World_EnvironmentConfig
 # from lobgen.data_processing.data_config import set_config, TokenizerConfig, get_config
 # set_config(TokenizerConfig(split_vocab=True)) 
 from gymnax_exchange.jaxen.StatesandParams import MMEnvState, MMEnvParams, LoadedEnvParams, LoadedEnvState, WorldState
 from gymnax_exchange.jaxen.StatesandParams import MultiAgentState
-from gymnax_exchange.jaxob.jaxob_config import World_EnvironmentConfig
 #from gymnax_exchange.jaxen.from_JAXMARL import spaces
 
 
@@ -302,6 +301,9 @@ class MarketMakingAgent():
         reward, extras = self._get_reward(state, params, trades,bestasks,bestbids)
         old_time=state.time
         old_mid_price=state.mid_price
+        # T+1 routing: sells reduce base_inventory, buys increase intraday_buys
+        new_base = state.base_inventory - extras["sellQuant"]
+        new_intraday = state.intraday_buys + extras["buyQuant"]
         state = MMEnvState(
             ask_raw_orders = asks,
             bid_raw_orders = bids,
@@ -318,7 +320,10 @@ class MarketMakingAgent():
             mid_price=extras["mid_price"],
             inventory=extras["end_inventory"],
             total_PnL = state.total_PnL + extras["PnL"],
-            cash_balance= extras["cash_balance"],          
+            cash_balance= extras["cash_balance"],
+            base_inventory=new_base,
+            intraday_buys=new_intraday,
+            base_cost_basis=state.base_cost_basis,
             delta_time = new_time[0] + new_time[1]/1e9 - state.time[0] - state.time[1]/1e9,
         )
         done = self.is_terminal(state, params)
@@ -424,12 +429,16 @@ class MarketMakingAgent():
         ) -> Tuple[chex.Array, MMEnvState]:
         """ Reset the environment state to the initial state."""
 
+        base_val = self.cfg.initial_base_inventory * (world_state.mid_price / self.world_config.tick_size)
         agent_state = MMEnvState(
             posted_distance_bid=0,
             posted_distance_ask=0,
             inventory=0,
             total_PnL=0.0,
-            cash_balance=0.0
+            cash_balance=base_val,
+            base_inventory=self.cfg.initial_base_inventory,
+            intraday_buys=0,
+            base_cost_basis=world_state.mid_price,
         )
 
         # Calculate things for the message obs space
@@ -514,7 +523,10 @@ class MarketMakingAgent():
             total_PnL=0.,
             # updated on reset:
             delta_time=0.,
-            cash_balance=0.0
+            cash_balance=0.0,
+            base_inventory=0,
+            intraday_buys=0,
+            base_cost_basis=0.0
         )
      
     def _filter_messages(
@@ -1866,10 +1878,86 @@ class MarketMakingAgent():
 
 
 
+    def _order_manager(self, target_msgs, world_state, agent_params):
+        """
+        OrderManager: compare target orders with current agent orders on the book.
+        
+        Instead of blanket cancel-all-and-repost, only cancel orders that 
+        actually changed. Orders identical to current ones are kept in place
+        (preserving queue position and reducing message traffic).
+        
+        Args:
+            target_msgs: (n_action, 8) - what the agent wants to place
+            world_state: current world state (has raw_orders with existing orders)
+            agent_params: contains trader_id for finding this agent's orders
+        
+        Returns:
+            opt_action_msgs: (n_action, 8) - only orders that need to be placed
+            opt_cancel_msgs: (n_cancel, 8) - only orders that need to be cancelled
+        """
+        trader_id = agent_params.trader_id
+        time_s = world_state.time[0]
+        time_ns = world_state.time[1]
+        cancel_size = self.cfg.num_messages_by_agent // 4
+
+        # 1. Find ALL current orders of this agent in the book
+        cnl_bid = job.getCancelMsgs(
+            bookside=world_state.bid_raw_orders,
+            agentID=trader_id,
+            size=cancel_size,
+            side=1,
+            cancel_time=time_s,
+            cancel_time_ns=time_ns
+        )
+        cnl_ask = job.getCancelMsgs(
+            bookside=world_state.ask_raw_orders,
+            agentID=trader_id,
+            size=cancel_size,
+            side=-1,
+            cancel_time=time_s,
+            cancel_time_ns=time_ns
+        )
+        all_current = jnp.concatenate([cnl_bid, cnl_ask], axis=0)  # (n_cancel_total, 8)
+
+        # 2. Extract comparison vectors
+        # Target orders (what the agent wants)
+        t_side = target_msgs[:, 1]
+        t_price = target_msgs[:, 3]
+        t_qty = target_msgs[:, 2]
+        t_valid = (t_price != 0)
+
+        # Current orders (what's already on the book)
+        c_side = all_current[:, 1]
+        c_price = all_current[:, 3]
+        c_qty = all_current[:, 2]
+        c_valid = (c_price != 0)
+
+        # 3. Build match matrix: (n_cancel, n_action)
+        #    order -> target match requires: same side + same price + same qty
+        same_side = (c_side[:, None] == t_side[None, :])
+        same_price = (c_price[:, None] == t_price[None, :])
+        same_qty = (c_qty[:, None] == t_qty[None, :])
+        both_valid = (c_valid[:, None] & t_valid[None, :])
+        match = same_side & same_price & same_qty & both_valid
+
+        # 4. A current order matched to ANY target → keep (don't cancel)
+        #    A target matched to ANY current order → skip (don't re-place)
+        c_keep = jnp.any(match, axis=1)   # (n_cancel,) 
+        t_skip = jnp.any(match, axis=0)   # (n_action,) 
+
+        # 5. Build optimized messages
+        # Zero out matched current orders (keep them on book)
+        opt_cancel = jnp.where(~c_keep[:, None], all_current, jnp.zeros_like(all_current))
+        # Zero out matched targets (already on book, don't re-place)
+        opt_action = jnp.where(~t_skip[:, None], target_msgs, jnp.zeros_like(target_msgs))
+
+        return opt_action, opt_cancel
+
+
     def get_messages(self, action: jax.Array, world_state: WorldState, agent_state:MMEnvState, agent_params: MMEnvParams):
         '''Get the action and cancel messages'''
         def doNothing_callback(action,action_msgs,cancel_msgs,empty_book):
-            if action==9 & empty_book==True:
+            if action == 9 and empty_book:
                 print("Market Maker doing nothing this step")
                 print("Action messages sent: ",action_msgs)
                 print("Cancel messages sent: ",cancel_msgs)
@@ -1880,30 +1968,45 @@ class MarketMakingAgent():
                                     agent_state,
                                     agent_params)
 
-        cancel_msgs_bid = job.getCancelMsgs(
-            bookside = world_state.bid_raw_orders,
-            agentID = agent_params.trader_id,
-            size = self.cfg.num_messages_by_agent//4,
-            side = 1,
-            cancel_time = world_state.time[0],
-            cancel_time_ns = world_state.time[1]
-        )
+        if self.cfg.use_order_manager:
+            # Use OrderManager: only cancel/re-place orders that changed
+            action_msgs, cancel_msgs = self._order_manager(
+                action_msgs, world_state, agent_params
+            )
+        else:
+            # Legacy: cancel all current orders, then filter matching prices
+            cancel_msgs_bid = job.getCancelMsgs(
+                bookside = world_state.bid_raw_orders,
+                agentID = agent_params.trader_id,
+                size = self.cfg.num_messages_by_agent//4,
+                side = 1,
+                cancel_time = world_state.time[0],
+                cancel_time_ns = world_state.time[1]
+            )
 
-        cancel_msgs_ask = job.getCancelMsgs(
-            bookside = world_state.ask_raw_orders,
-            agentID = agent_params.trader_id,
-            size = self.cfg.num_messages_by_agent//4,
-            side = -1,
-            cancel_time = world_state.time[0],
-            cancel_time_ns = world_state.time[1]
-        )
-        cancel_msgs = jnp.concatenate([cancel_msgs_bid, cancel_msgs_ask], axis=0)
+            cancel_msgs_ask = job.getCancelMsgs(
+                bookside = world_state.ask_raw_orders,
+                agentID = agent_params.trader_id,
+                size = self.cfg.num_messages_by_agent//4,
+                side = -1,
+                cancel_time = world_state.time[0],
+                cancel_time_ns = world_state.time[1]
+            )
+            cancel_msgs = jnp.concatenate([cancel_msgs_bid, cancel_msgs_ask], axis=0)
+
+            # Do filtering to net cancellations in MM
+            action_msgs, cancel_msgs = self._filter_messages(action_msgs, cancel_msgs)
 
         #jax.debug.print(f"Market Maker action msg: {action_msgs}")
         #jax.debug.print(f"Market Maker cancel msg: {mm_cnl_msgs}")
 
-        # Do filtering to net cancellations in MM)
-        action_msgs, cancel_msgs = self._filter_messages(action_msgs, cancel_msgs)
+        # T+1 hard constraint: clamp sell quantities to available base inventory.
+        # sell orders have side == -1 (ask side). Can only sell what you held before today.
+        max_sell = jnp.maximum(0, agent_state.base_inventory)
+        sell_mask = action_msgs[:, 1] == -1
+        action_msgs = action_msgs.at[:, 2].set(
+            jnp.where(sell_mask, jnp.minimum(action_msgs[:, 2], max_sell), action_msgs[:, 2])
+        )
 
         #jax.debug.print("action messages order mm: {}", action_msgs)
         #jax.debug.print("cancel messages order mm: {}", cancel_msgs)
@@ -2367,7 +2470,10 @@ class MarketMakingAgent():
                 jnp.abs(passive_sells[:, job.cst.TradesFeat.Q.value])).sum()
         )
         rebate_income = rebate_value * (self.cfg.rebate_bps / 10_000)
-        
+        # T+1: transaction cost (commission replaces rebate for A股, still 0 for backward compat)
+        commission_cost = (income + outgoing) * (self.cfg.commission_bps / 10_000)
+        # T+1: stamp duty on sells only (A股 印花税: 万10 = 10bps on sell side)
+        stamp_duty = income * (self.cfg.stamp_duty_bps / 10_000)
 
         # Compute a reference price based on the config
         if self.cfg.reference_price == "mid_avg":
@@ -2432,6 +2538,12 @@ class MarketMakingAgent():
         #A3) Spooner Scaled
         scaledInventoryPnL=InventoryPnL//(jnp.abs(agent_state.inventory)+1)
         reward_spooner_scaled=buyPnL + sellPnL + rebate_income + self.cfg.inventoryPnL_eta*(InventoryPnL - (1-self.cfg.inventoryPnL_eta)*jnp.maximum(0,InventoryPnL) )
+        
+        #A4) T+1 reward (builds on spooner_asym_damped2)
+        # Adds commission cost and overnight penalty for locked intraday positions
+        reward_tplus1 = buyPnL + sellPnL - commission_cost - stamp_duty \
+            + self.cfg.inventoryPnL_gamma*(InventoryPnL - jnp.maximum(0, self.cfg.inventoryPnL_eta*InventoryPnL)) \
+            - self.cfg.overnight_penalty_lambda * (jnp.abs(agent_state.intraday_buys) + jnp.maximum(0, -agent_state.base_inventory))
         
         #----------------------B) Complex reward---------------------------------------------#
         inventory_change= buyQuant - sellQuant
@@ -2509,6 +2621,8 @@ class MarketMakingAgent():
             reward=reward_spooner_scaled
         elif self.cfg.reward_function=="delta_portfolio_value":
             reward=delta_netWorth
+        elif self.cfg.reward_function=="tplus1":
+            reward=reward_tplus1
         else:
             raise ValueError("Invalid reward_space specified.")
         
@@ -2649,6 +2763,9 @@ class MarketMakingAgent():
             "reward_spooner_asym_damped":reward_spooner_asym_damped,
             "reward_spooner_asym_damped2":reward_spooner_asym_damped2,
             "reward_spooner_scaled":reward_spooner_scaled,
+            "reward_tplus1":reward_tplus1,
+            "commission_cost":commission_cost,
+            "stamp_duty":stamp_duty,
             "reward_delta_portfolio_value":delta_netWorth,
             "forced_unwind":forced_unwind,
             "market_share": market_share,
@@ -2685,7 +2802,11 @@ class MarketMakingAgent():
             posted_distance_ask = extras["ask_distance_from_best"],
             inventory = new_inventory,
             total_PnL = new_PnL,
-            cash_balance= new_cash_balance    
+            cash_balance= new_cash_balance,
+            # T+1: sells reduce base, buys add to intraday
+            base_inventory = agent_state_old.base_inventory - extras["sellQuant"],
+            intraday_buys = agent_state_old.intraday_buys + extras["buyQuant"],
+            base_cost_basis = agent_state_old.base_cost_basis
         )
         
         # Get done
@@ -3090,20 +3211,30 @@ class MarketMakingAgent():
             }
 
         elif self.world_config.ep_type == "fixed_steps": # leave away time related stuff
+            # --- Engineered feature engineering ---
+            # Order book imbalance: positive = more bids (upward pressure)
+            tot_vol = bid_vol_tot + ask_vol_tot
+            imbalance = jnp.where(tot_vol > 0, (bid_vol_tot - ask_vol_tot) / tot_vol.astype(jnp.float32), 0.0)
+            # Spread relative to mid price (dimensionless)
+            spread_ratio = spread / jnp.maximum(world_state.mid_price, 1)
+            # Inventory relative to base (normalized)
+            inv_val = jnp.array(agent_state.inventory, dtype=jnp.float32)
+            base_inv = jnp.maximum(jnp.array(agent_state.base_inventory, dtype=jnp.float32), 1.0)
+            inventory_ratio = inv_val / base_inv
+
             obs = {
-                # "dist_of_posted_ask": agent_state.posted_distance_ask,
-                # "dist_of_posted_bid": agent_state.posted_distance_bid,
-                "p_bid" : world_state.best_bids[-1][0],  
-                "p_ask":world_state.best_asks[-1][0], 
+                "p_bid" : world_state.best_bids[-1][0],
+                "p_ask":world_state.best_asks[-1][0],
                 "spread": spread,
-                "q_bid": bid_vol_tot,#world_state.best_bids[-1][1],
-                "q_ask": ask_vol_tot,#world_state.best_asks[-1][1],
+                "q_bid": bid_vol_tot,
+                "q_ask": ask_vol_tot,
                 "mid_price":world_state.mid_price,
                 "step_counter": world_state.step_counter,
-                # Set Agent specific stuff
-                # "total_PnL" : agent_state.total_PnL,
-                # "cash_balance" : agent_state.cash_balance,
                 "inventory" : agent_state.inventory,
+                # New engineered features
+                "imbalance": imbalance,
+                "spread_ratio": spread_ratio,
+                "inventory_ratio": inventory_ratio,
             }
 
             # TODO: put this into config somewhere?
@@ -3111,37 +3242,33 @@ class MarketMakingAgent():
             #       by e.g. functional transformations or maybe gymnax obs norm wrapper suffices?
 
             means = {
-                # "dist_of_posted_ask": 0,
-                # "dist_of_posted_bid": 0,
                 "p_bid" : 0,
-                "p_ask":0, 
+                "p_ask":0,
                 "spread": 0,
                 "q_bid": 0,
                 "q_ask": 0,
                 "mid_price":0,
                 "step_counter": 0,
-
-                # Set Agent specific stuff
-                # "total_PnL" : 0,
-                # "cash_balance" : 0,
                 "inventory" : 0,
+                # New features
+                "imbalance": 0.0,
+                "spread_ratio": 0.0,
+                "inventory_ratio": 0.0,
             }
 
             stds = {
-                # "dist_of_posted_ask": 1,
-                # "dist_of_posted_bid": 1,
                 "p_bid" : 1e6,
-                "p_ask":1e6, 
+                "p_ask":1e6,
                 "spread": 1e4,
                 "q_bid": 1000,
                 "q_ask": 1000,
                 "mid_price":1e6,
                 "step_counter": 10,
-
-                # Set Agent specific stuff
-                # "total_PnL" : 1000,
-                # "cash_balance" : 1000,
                 "inventory" : 10,
+                # New features
+                "imbalance": 1.0,
+                "spread_ratio": 0.01,
+                "inventory_ratio": 1.0,
             }
 
         if normalize:
@@ -3198,7 +3325,7 @@ class MarketMakingAgent():
             if self.world_config.ep_type == "fixed_time":
              return spaces.Box(-1000, 1000, (10,), dtype=jnp.float32)
             elif self.world_config.ep_type == "fixed_steps":
-                return spaces.Box(-1000, 1000, (8,), dtype=jnp.float32)
+                return spaces.Box(-1000, 1000, (11,), dtype=jnp.float32)
         elif self.cfg.observation_space =="messages":
                 num_messages_total=self.cfg.num_messages_by_agent+self.world_config.n_data_msg_per_step
                 return spaces.Box(low=-1*self.world_config.maxint, high=self.world_config.maxint ,shape=(num_messages_total, 8), dtype=jnp.int32)

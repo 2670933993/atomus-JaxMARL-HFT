@@ -15,7 +15,7 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
 
 
 from gymnax_exchange.jaxen.marl_env import MARLEnv
-from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_EnvironmentConfig, World_EnvironmentConfig
+from gymnax_exchange.config.env_configs import MultiAgentConfig, Execution_EnvironmentConfig, World_EnvironmentConfig
 from gymnax_exchange.jaxrl.MARL.baseline_eval.baseline_JAXMARL import Transition
 import argparse
 

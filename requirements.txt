@@ -1,5 +1,4 @@
 # JAX
-jax[cuda12]
 optax
 flax
 chex

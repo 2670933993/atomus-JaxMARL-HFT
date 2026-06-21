@@ -1,3 +1,4 @@
+# LSTM+PPO
 """
 Based on PureJaxRL Implementation of PPO
 """
@@ -32,7 +33,7 @@ import gc
 #from jaxmarl.wrappers.baselines import SMAXLogWrapper
 #from jaxmarl.environments.smax import map_name_to_scenario, HeuristicEnemySMAX
 from gymnax_exchange.jaxen.marl_env import MARLEnv
-from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_EnvironmentConfig, World_EnvironmentConfig,MarketMaking_EnvironmentConfig
+from gymnax_exchange.config.env_configs import MultiAgentConfig, Execution_EnvironmentConfig, World_EnvironmentConfig, MarketMaking_EnvironmentConfig
 
 import wandb
 import functools
@@ -40,7 +41,7 @@ import matplotlib.pyplot as plt
 
 import sys
 
-class ScannedRNN(nn.Module):
+class ScannedLSTM(nn.Module):
     @functools.partial(
         nn.scan,
         variable_broadcast="params",
@@ -50,21 +51,19 @@ class ScannedRNN(nn.Module):
     )
     @nn.compact
     def __call__(self, carry, x):
-        """Applies the module."""
-        rnn_state = carry
+        """Applies the module. carry = (hidden, cell) tuple for LSTM."""
         ins, resets = x
-        rnn_state = jnp.where(
-            resets[:, jnp.newaxis],
-            self.initialize_carry(*rnn_state.shape),
-            rnn_state,
-        )
-        new_rnn_state, y = nn.GRUCell(features=ins.shape[1])(rnn_state, ins)
+        # LSTM carry is (hidden, cell); reset both on episode done
+        reset_state = self.initialize_carry(carry[0].shape[0], carry[0].shape[1])
+        hidden = jnp.where(resets[:, jnp.newaxis], reset_state[0], carry[0])
+        cell   = jnp.where(resets[:, jnp.newaxis], reset_state[1], carry[1])
+        new_rnn_state, y = nn.LSTMCell(features=ins.shape[1])((hidden, cell), ins)
         return new_rnn_state, y
 
     @staticmethod
     def initialize_carry(batch_size, hidden_size):
         # Use a dummy key since the default state init fn is just zeros.
-        cell = nn.GRUCell(features=hidden_size)
+        cell = nn.LSTMCell(features=hidden_size)
         return cell.initialize_carry(jax.random.PRNGKey(0), (batch_size, hidden_size))
 
 
@@ -84,7 +83,7 @@ class ActorCriticRNN(nn.Module):
 
         rnn_in = (embedding, dones)
 
-        hidden, embedding = ScannedRNN()(hidden, rnn_in)
+        hidden, embedding = ScannedLSTM()(hidden, rnn_in)
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
         )
@@ -137,10 +136,25 @@ def make_train(config):
     print("init_key: ", init_key)
     ###############CLAUDE##############
     # Create a MultiAgentConfig object with parameters from the config
+    # Build a case-insensitive field mapping for dataclass constructors.
+    # YAML keys may differ in case from dataclass field names (e.g. "inventoryPnL_eta").
+    def _build_agent_cfg(agent_type, agent_cfg):
+        cls = config_dict[agent_type]
+        valid_fields = {f.name.lower(): f.name for f in cls.__dataclass_fields__.values()}
+        mapped = {}
+        for k, v in agent_cfg.items():
+            key_lower = k.lower()
+            if key_lower in valid_fields:
+                mapped[valid_fields[key_lower]] = v
+            else:
+                # pass through as-is for forward compatibility
+                mapped[k] = v
+        return cls(**mapped)
+
     agent_configs = {}
     if "AGENT_CONFIGS" in config:
         agent_configs = {
-            agent_type: config_dict[agent_type](**{k.lower(): v for k, v in agent_cfg.items()})
+            agent_type: _build_agent_cfg(agent_type, agent_cfg)
             for agent_type, agent_cfg in config["AGENT_CONFIGS"].items()
         }
     else:
@@ -173,7 +187,7 @@ def make_train(config):
     eval_agent_configs = {}
     if "AGENT_CONFIGS" in config:
         eval_agent_configs = {
-            agent_type: config_dict[agent_type](**{k.lower(): v for k, v in agent_cfg.items()})
+            agent_type: _build_agent_cfg(agent_type, agent_cfg)
             for agent_type, agent_cfg in config["AGENT_CONFIGS"].items()
         }
     else:
@@ -182,7 +196,9 @@ def make_train(config):
             for agent_type, agent_cfg in config_dict.items()
         }
         
-    ma_config = MultiAgentConfig(
+    eval_ma_config = None
+    if config["CALC_EVAL"]:
+        eval_ma_config = MultiAgentConfig(
         number_of_agents_per_type=config["NUM_AGENTS_PER_TYPE"],
         dict_of_agents_configs=eval_agent_configs,
         world_config=World_EnvironmentConfig(
@@ -199,7 +215,10 @@ def make_train(config):
 
 
     env : MARLEnv = MARLEnv(key=init_key, multi_agent_config=ma_config)
-    eval_env: MARLEnv = MARLEnv(key=init_key,multi_agent_config=eval_ma_config)
+    if config["CALC_EVAL"]:
+        eval_env: MARLEnv = MARLEnv(key=init_key,multi_agent_config=eval_ma_config)
+    else:
+        eval_env = None
     
     agent_type_names = list(env.type_names)
 
@@ -253,7 +272,7 @@ def make_train(config):
             )
 
             # FIXME: very unsure about this, why is it NUM_ENVS and not NUM_ACTORS?
-            init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
+            init_hstate = ScannedLSTM.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
             network_params = network.init(_rng, init_hstate, init_x)
             if config["ANNEAL_LR"][i]:
                 tx = optax.chain(
@@ -270,7 +289,7 @@ def make_train(config):
                 params=network_params,
                 tx=tx,
             )
-            init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS_PERTYPE"][i], config["GRU_HIDDEN_DIM"])
+            init_hstate = ScannedLSTM.initialize_carry(config["NUM_ACTORS_PERTYPE"][i], config["GRU_HIDDEN_DIM"])
 
             # Instead of appending dicts, maintain separate lists for each attribute
             hstates.append(init_hstate)
@@ -283,7 +302,10 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         env_params=env.default_params
-        eval_env_params=eval_env.default_params # type: ignore
+        if config["CALC_EVAL"]:
+            eval_env_params=eval_env.default_params # type: ignore
+        else:
+            eval_env_params = None
 
         # env_params=jax.device_put(env_params)
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,None))(reset_rng,env_params)
@@ -361,10 +383,9 @@ def make_train(config):
                 wandb.log(logging_dict)
 
             for i in range(len(metric["avg_reward"])):
-                print(f"avg_reward_{i} {metric["avg_reward"][i]}")
+                print(f"avg_reward_{i} {metric['avg_reward'][i]}")
                 if config["CALC_EVAL"]:
-                    print(f"avg_eval_reward_{i} {metric["avg_reward_eval"][i]}")
-
+                    print(f"avg_eval_reward_{i} {metric['avg_reward_eval'][i]}")
         def speed_only_callback(metric):
             logging_dict = {
                     "env_step": (metric["update_steps"][0]+1)
@@ -470,6 +491,11 @@ def make_train(config):
                             transition.value,
                             transition.reward,
                         )
+                        # Reward normalization: batch z-score (enabled by REWARD_NORM flag)
+                        if config.get("REWARD_NORM", False):
+                            r_mean = jnp.mean(reward)
+                            r_std = jnp.std(reward) + 1e-8
+                            reward = (reward - r_mean) / r_std
                         delta = reward + gamma * next_value * (1 - done) - value
                         gae = (
                             delta
@@ -516,7 +542,7 @@ def make_train(config):
                             # RERUN NETWORK
                             _, pi, value = train_state.apply_fn(
                                 params,
-                                init_hstate.squeeze(),
+                                (init_hstate[0].squeeze(), init_hstate[1].squeeze()),
                                 (traj_batch.obs, traj_batch.done),
                             )
                             log_prob = pi.log_prob(traj_batch.action)
@@ -578,8 +604,9 @@ def make_train(config):
                     rng, _rng = jax.random.split(rng)
 
                     # adding an additional "fake" dimensionality to perform minibatching correctly
-                    init_hstate = jnp.reshape(
-                        init_hstate, (1, config["NUM_ACTORS_PERTYPE"][i]//config["N_DEVICES"], -1)
+                    init_hstate = (
+                        jnp.reshape(init_hstate[0], (1, config["NUM_ACTORS_PERTYPE"][i]//config["N_DEVICES"], -1)),
+                        jnp.reshape(init_hstate[1], (1, config["NUM_ACTORS_PERTYPE"][i]//config["N_DEVICES"], -1)),
                     )
                     batch = (
                         init_hstate,
@@ -611,7 +638,7 @@ def make_train(config):
                     )
                     update_state = (
                         train_state,
-                        init_hstate.squeeze(),
+                        (init_hstate[0].squeeze(), init_hstate[1].squeeze()),
                         traj_batch,
                         advantages,
                         targets,
@@ -737,7 +764,7 @@ def make_train(config):
                 eval_hstates=[]
                 init_dones_agents_eval=[]
                 for i,train_state in enumerate(train_states):
-                    eval_hstates.append(ScannedRNN.initialize_carry(config["NUM_ACTORS_PERTYPE"][i]//config["N_DEVICES"], config["GRU_HIDDEN_DIM"]))
+                    eval_hstates.append(ScannedLSTM.initialize_carry(config["NUM_ACTORS_PERTYPE"][i]//config["N_DEVICES"], config["GRU_HIDDEN_DIM"]))
                     init_dones_agents_eval.append(jnp.zeros((config["NUM_ACTORS_PERTYPE"][i]//config["N_DEVICES"]), dtype=bool))
 
 
@@ -814,7 +841,10 @@ def make_train(config):
 
         print("\nHidden state details:")
         for i, h in enumerate(hstates):
-            print(f"Agent type {i} hidden state shape: {h.shape}")
+            if isinstance(h, tuple):
+                print(f"Agent type {i} hidden (h) shape: {h[0].shape}, cell (c) shape: {h[1].shape}")
+            else:
+                print(f"Agent type {i} hidden state shape: {h.shape}")
 
         
         for i in range(config["NUM_UPDATES"]):
@@ -823,7 +853,7 @@ def make_train(config):
             # if i>2 and i<4:
             #     jax.profiler.start_trace("/tmp/profile-data")
             (runner_state,updates),metrics=pmapped_update_step((runner_state,updates),env_params,eval_env_params)
-            speed_only_callback(metrics)
+            callback(metrics)
 
             # if i>2 and i<4:
             #     jax.block_until_ready((runner_state,updates,metrics))
@@ -852,10 +882,16 @@ def make_train(config):
 @hydra.main(version_base="1.3", config_path="../../../config/rl_configs", config_name="PMAP_ippo_rnn_JAXMARL_2player")
 def main(config):
     print("MultiAgentConfig", MultiAgentConfig().world_config)
-    env_config=OmegaConf.structured(MultiAgentConfig(number_of_agents_per_type=config["NUM_AGENTS_PER_TYPE"]))
+    # Save YAML world_config BEFORE merge (env_config defaults have AMZN/20120621)
+    yaml_world_config = OmegaConf.to_container(config.get("world_config", {}))
+    env_config=OmegaConf.structured(MultiAgentConfig(
+        number_of_agents_per_type=config["NUM_AGENTS_PER_TYPE"],
+        world_config=World_EnvironmentConfig(**yaml_world_config)
+    ))
     final_config=OmegaConf.merge(config,env_config)
     config = OmegaConf.to_container(final_config)
-
+    # Restore YAML world_config (ensure our values survive the merge)
+    config["world_config"] = yaml_world_config
 
     print(config)
 
@@ -980,8 +1016,12 @@ def main(config):
 def seperate_main(config):
     print("MultiAgentConfig", MultiAgentConfig().world_config)
     env_config=OmegaConf.structured(MultiAgentConfig(number_of_agents_per_type=config["NUM_AGENTS_PER_TYPE"]))
+    # Save YAML world_config before merge (env_config defaults override it)
+    yaml_world_config = config.get("world_config", {})
     final_config=OmegaConf.merge(config,env_config)
     config = OmegaConf.to_container(final_config)
+    # Restore YAML world_config
+    config["world_config"] = yaml_world_config
 
     # jax.profiler.start_trace("/tmp/profile-data")
 

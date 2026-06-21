@@ -1,28 +1,41 @@
+"""
+LOBSTER-related constants and Mamba model configuration dataclasses.
+
+LOBSTER column names and token constants are now centralized in
+gymnax_exchange/config/constants.py and re-exported here for
+backward compatibility.
+
+The Mamba dataclasses live here because they are specific to
+LOBSTER-based model training/inference tasks.
+"""
+
 from dataclasses import dataclass
 import numpy as np
 
-TIME_COL = "<time>"
-EVENT_TYPE_COL = "<event_type>"
-ORDER_ID_COL = "<order_id>"
-SIZE_COL = "<size>"
-PRICE_COL = "<price>"
-DIRECTION_COL = "<direction>"
+# Re-export LOBSTER token constants from centralized location
+from gymnax_exchange.config.constants import (           # noqa: F401
+    TIME_COL,
+    EVENT_TYPE_COL,
+    ORDER_ID_COL,
+    SIZE_COL,
+    PRICE_COL,
+    DIRECTION_COL,
+    MESSAGE_TOKEN_DTYPE_MAP,
+    MESSAGE_TOKEN_TYPES,
+)
 
-MESSAGE_TOKEN_DTYPE_MAP = {
-    TIME_COL: int,  
-    EVENT_TYPE_COL: int,
-    ORDER_ID_COL: int,
-    SIZE_COL: int,
-    PRICE_COL: int,
-    DIRECTION_COL: int
-}
-MESSAGE_TOKEN_TYPES = list(MESSAGE_TOKEN_DTYPE_MAP.keys())
 
-def get_orderbook_token_types(levels: int) -> list[str]: 
+def get_orderbook_token_types(levels: int) -> list[str]:
+    """Generate token type names for orderbook levels."""
     return np.array([
-                [f"<ask_price_{i}>", f"<ask_size_{i}>", f"<bid_price_{i}>", f"<bid_size_{i}>"]
-                for i in range(1, levels + 1)]
-            ).flatten().tolist()
+        [f"<ask_price_{i}>", f"<ask_size_{i}>", f"<bid_price_{i}>", f"<bid_size_{i}>"]
+        for i in range(1, levels + 1)]
+    ).flatten().tolist()
+
+
+# ──────────────────────────────────────────────
+# Mamba / Tokenizer Configuration
+# ──────────────────────────────────────────────
 
 @dataclass
 class MambaTrainArgs:
@@ -41,7 +54,6 @@ class MambaTrainArgs:
     wandb_entity: str = "gereon-franken-oxford"
 
 
-
 @dataclass
 class MambaInferenceArgs:
     model_path: str
@@ -58,11 +70,13 @@ class MambaInferenceArgs:
     repetition_penalty: float = 1.0
     batch: int = 1
 
+
 @dataclass
 class MambaBenchmarkingArgs(MambaInferenceArgs):
     data_dir: str = "data/GOOG/2018/"
     data_time_stamp: str = "2018-12-31"
     save_path: str = "gen_data/"
+
 
 @dataclass
 class TokenizerTrainArgs:
